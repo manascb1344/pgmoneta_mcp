@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::constant::MASTER_KEY_PATH;
+use crate::constant::{Encryption, MASTER_KEY_PATH};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::anyhow;
@@ -378,6 +378,200 @@ impl SecurityUtil {
 impl Default for SecurityUtil {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SecurityUtil {
+    pub fn compress_data(&self, data: &[u8], algorithm: u8) -> anyhow::Result<Vec<u8>> {
+        match algorithm {
+            1 => {
+                use flate2::Compression;
+                use flate2::write::GzEncoder;
+                use std::io::Write;
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(data)?;
+                Ok(encoder.finish()?)
+            }
+            2 => {
+                use std::io::Write;
+                let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3)?;
+                encoder.write_all(data)?;
+                Ok(encoder.finish()?)
+            }
+            3 => {
+                use lz4::EncoderBuilder;
+                use std::io::Write;
+                let mut encoder = EncoderBuilder::new().build(Vec::new())?;
+                encoder.write_all(data)?;
+                let (result, _) = encoder.finish();
+                Ok(result)
+            }
+            4 => {
+                use bzip2::Compression;
+                use bzip2::write::BzEncoder;
+                use std::io::Write;
+                let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(data)?;
+                Ok(encoder.finish()?)
+            }
+            _ => Ok(data.to_vec()),
+        }
+    }
+
+    pub fn decompress_data(&self, data: &[u8], algorithm: u8) -> anyhow::Result<Vec<u8>> {
+        match algorithm {
+            1 => {
+                use flate2::read::GzDecoder;
+                use std::io::Read;
+                let mut decoder = GzDecoder::new(data);
+                let mut result = Vec::new();
+                decoder.read_to_end(&mut result)?;
+                Ok(result)
+            }
+            2 => {
+                use std::io::Read;
+                let mut decoder = zstd::stream::read::Decoder::new(data)?;
+                let mut result = Vec::new();
+                decoder.read_to_end(&mut result)?;
+                Ok(result)
+            }
+            3 => {
+                use lz4::Decoder;
+                use std::io::Read;
+                let mut decoder = Decoder::new(data)?;
+                let mut result = Vec::new();
+                decoder.read_to_end(&mut result)?;
+                Ok(result)
+            }
+            4 => {
+                use bzip2::read::BzDecoder;
+                use std::io::Read;
+                let mut decoder = BzDecoder::new(data);
+                let mut result = Vec::new();
+                decoder.read_to_end(&mut result)?;
+                Ok(result)
+            }
+            _ => Ok(data.to_vec()),
+        }
+    }
+
+    pub fn encrypt_aes_cbc_with_salt(
+        &self,
+        plaintext: &[u8],
+        encryption_mode: u8,
+    ) -> anyhow::Result<Vec<u8>> {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        use pbkdf2::pbkdf2_hmac;
+        use rand::TryRngCore;
+        use sha2::Sha256;
+        type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+        type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+        const PBKDF2_ITERATIONS: u32 = 600000;
+        const SALT_LEN: usize = 16;
+
+        let key_len = match encryption_mode {
+            Encryption::AES_256_CBC => 32,
+            Encryption::AES_192_CBC => 24,
+            Encryption::AES_128_CBC => 16,
+            _ => return Err(anyhow!("Invalid encryption mode: {}", encryption_mode)),
+        };
+
+        let master_key = self.load_master_key()?;
+
+        let mut salt = [0u8; SALT_LEN];
+        rand::rngs::OsRng.try_fill_bytes(&mut salt)?;
+
+        let mut derived = vec![0u8; key_len + 16];
+        pbkdf2_hmac::<Sha256>(&master_key, &salt, PBKDF2_ITERATIONS, &mut derived);
+
+        let key = &derived[..key_len];
+        let iv = &derived[key_len..];
+
+        let mut buffer = plaintext.to_vec();
+        let pad_len = 16 - (plaintext.len() % 16);
+        buffer.extend(vec![pad_len as u8; pad_len]);
+
+        match key_len {
+            32 => Aes256CbcEnc::new(key.into(), iv.into())
+                .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(
+                    &mut buffer,
+                    plaintext.len(),
+                ),
+            24 => Aes192CbcEnc::new(key.into(), iv.into())
+                .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(
+                    &mut buffer,
+                    plaintext.len(),
+                ),
+            16 => Aes128CbcEnc::new(key.into(), iv.into())
+                .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(
+                    &mut buffer,
+                    plaintext.len(),
+                ),
+            _ => unreachable!(),
+        }
+        .map_err(|e| anyhow!("AES CBC encryption failed: {:?}", e))?;
+
+        let mut result = Vec::with_capacity(SALT_LEN + buffer.len());
+        result.extend_from_slice(&salt);
+        result.extend(buffer);
+
+        Ok(result)
+    }
+
+    pub fn decrypt_aes_cbc_with_salt(
+        &self,
+        ciphertext: &[u8],
+        encryption_mode: u8,
+    ) -> anyhow::Result<Vec<u8>> {
+        use aes::cipher::{BlockDecryptMut, KeyIvInit};
+        use pbkdf2::pbkdf2_hmac;
+        use sha2::Sha256;
+        type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+        type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
+        type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+
+        const PBKDF2_ITERATIONS: u32 = 600000;
+        const SALT_LEN: usize = 16;
+
+        if ciphertext.len() <= SALT_LEN {
+            return Err(anyhow!("Ciphertext too short"));
+        }
+
+        let key_len = match encryption_mode {
+            Encryption::AES_256_CBC => 32,
+            Encryption::AES_192_CBC => 24,
+            Encryption::AES_128_CBC => 16,
+            _ => return Err(anyhow!("Invalid encryption mode: {}", encryption_mode)),
+        };
+
+        let salt = &ciphertext[..SALT_LEN];
+        let encrypted_data = &ciphertext[SALT_LEN..];
+
+        let master_key = self.load_master_key()?;
+
+        let mut derived = vec![0u8; key_len + 16];
+        pbkdf2_hmac::<Sha256>(&master_key, salt, PBKDF2_ITERATIONS, &mut derived);
+
+        let key = &derived[..key_len];
+        let iv = &derived[key_len..];
+
+        let mut buffer = encrypted_data.to_vec();
+        let len = match key_len {
+            32 => Aes256CbcDec::new(key.into(), iv.into())
+                .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer),
+            24 => Aes192CbcDec::new(key.into(), iv.into())
+                .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer),
+            16 => Aes128CbcDec::new(key.into(), iv.into())
+                .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer),
+            _ => unreachable!(),
+        }
+        .map_err(|e| anyhow!("AES CBC decryption failed: {:?}", e))?
+        .len();
+
+        buffer.truncate(len);
+        Ok(buffer)
     }
 }
 
