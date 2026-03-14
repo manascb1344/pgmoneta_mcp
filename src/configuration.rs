@@ -57,12 +57,12 @@ pub struct PgmonetaConfiguration {
     pub port: i32,
     /// Compression algorithm for MCP <-> pgmoneta communication.
     /// Supported: "none", "gzip", "zstd", "lz4", "bzip2".
-    /// Default: "none".
+    /// Default: "zstd".
     #[serde(default = "default_compression")]
     pub compression: String,
     /// Encryption algorithm for MCP <-> pgmoneta communication.
     /// Supported: "none", "aes_256_cbc", "aes_192_cbc", "aes_128_cbc".
-    /// Default: "none".
+    /// Default: "aes_256_cbc".
     #[serde(default = "default_encryption")]
     pub encryption: String,
 }
@@ -184,9 +184,9 @@ fn default_log_rotation_age() -> String {
 }
 
 fn default_compression() -> String {
-    "none".to_string()
+    "zstd".to_string()
 }
 
 fn default_encryption() -> String {
-    "none".to_string()
+    "aes_256_cbc".to_string()
 }
