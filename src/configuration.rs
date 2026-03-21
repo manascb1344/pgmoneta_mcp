@@ -57,6 +57,16 @@ pub struct PgmonetaConfiguration {
     pub host: String,
     /// The port of the pgmoneta instance (Required).
     pub port: i32,
+    /// Compression algorithm for MCP <-> pgmoneta communication.
+    /// Supported: "none", "gzip", "zstd", "lz4", "bzip2".
+    /// Default: "zstd".
+    #[serde(default = "default_compression")]
+    pub compression: String,
+    /// Encryption algorithm for MCP <-> pgmoneta communication.
+    /// Supported: "none", "aes_256_cbc", "aes_192_cbc", "aes_128_cbc".
+    /// Default: "aes_256_cbc".
+    #[serde(default = "default_encryption")]
+    pub encryption: String,
 }
 
 /// Configuration properties for the MCP server itself.
@@ -166,9 +176,6 @@ pub fn load_user_configuration(user_path: &str) -> anyhow::Result<UserConf> {
     })
 }
 
-// Private default value functions for Serde deserialization.
-// Note: Internal helper functions generally do not require public API documentation.
-
 fn default_port() -> i32 {
     8000
 }
@@ -234,4 +241,12 @@ fn default_llm_model_for_provider(provider: &str) -> anyhow::Result<String> {
 
 fn validate_llm_provider(provider: &str) -> anyhow::Result<()> {
     default_llm_model_for_provider(provider).map(|_| ())
+}
+
+fn default_compression() -> String {
+    "zstd".to_string()
+}
+
+fn default_encryption() -> String {
+    "aes_256_cbc".to_string()
 }

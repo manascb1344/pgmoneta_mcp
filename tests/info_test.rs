@@ -5,6 +5,7 @@ use rmcp::handler::server::router::tool::AsyncTool;
 use serde_json::Value;
 mod common;
 #[tokio::test]
+#[ignore = "requires pgmoneta stack (see test/check.sh and full-test CI job)"]
 async fn info_test() {
     common::init_config();
 

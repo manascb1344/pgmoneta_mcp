@@ -15,6 +15,7 @@
 
 mod info;
 
+use super::compression::CompressionUtil;
 use super::configuration::CONFIG;
 use super::constant::*;
 use super::security::SecurityUtil;
@@ -24,6 +25,25 @@ use serde::Serialize;
 use std::fmt::Debug;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+fn parse_compression(compression: &str) -> u8 {
+    match compression.to_lowercase().as_str() {
+        "gzip" => Compression::GZIP,
+        "zstd" => Compression::ZSTD,
+        "lz4" => Compression::LZ4,
+        "bzip2" => Compression::BZIP2,
+        _ => Compression::NONE,
+    }
+}
+
+fn parse_encryption(encryption: &str) -> u8 {
+    match encryption.to_lowercase().as_str() {
+        "aes_256_cbc" => Encryption::AES_256_CBC,
+        "aes_192_cbc" => Encryption::AES_192_CBC,
+        "aes_128_cbc" => Encryption::AES_128_CBC,
+        _ => Encryption::NONE,
+    }
+}
 
 /// Represents the header of a request sent to the pgmoneta server.
 ///
@@ -70,14 +90,15 @@ impl PgmonetaClient {
     /// The header includes the current local timestamp and defaults to
     /// no encryption or compression, expecting a JSON response.
     fn build_request_header(command: u32) -> RequestHeader {
+        let config = CONFIG.get().expect("Configuration should be enabled");
         let timestamp = Local::now().format("%Y%m%d%H%M%S").to_string();
         RequestHeader {
             command,
             client_version: CLIENT_VERSION.to_string(),
             output_format: Format::JSON,
             timestamp,
-            compression: Compression::NONE,
-            encryption: Encryption::NONE,
+            compression: parse_compression(&config.pgmoneta.compression),
+            encryption: parse_encryption(&config.pgmoneta.encryption),
         }
     }
 
@@ -119,39 +140,71 @@ impl PgmonetaClient {
         Ok(stream)
     }
 
-    /// Writes a serialized JSON request string to the active TCP stream.
-    ///
-    /// Protocol flow:
-    /// 1. Writes the compression flag.
-    /// 2. Writes the encryption flag.
-    /// 3. Writes the length of the payload.
-    /// 4. Writes the exact payload bytes.
-    async fn write_request(request_str: &str, stream: &mut TcpStream) -> anyhow::Result<()> {
-        let mut request_buf = Vec::new();
-        request_buf.write_i32(request_str.len() as i32).await?;
-        request_buf.write_all(request_str.as_bytes()).await?;
+    async fn write_request(
+        request_str: &str,
+        stream: &mut TcpStream,
+        compression: u8,
+        encryption: u8,
+    ) -> anyhow::Result<()> {
+        let security_util = SecurityUtil::new();
 
-        stream.write_u8(Compression::NONE).await?;
-        stream.write_u8(Encryption::NONE).await?;
-        stream.write_all(request_buf.as_slice()).await?;
+        let payload = if compression != Compression::NONE || encryption != Encryption::NONE {
+            let mut data = request_str.as_bytes().to_vec();
+
+            if compression != Compression::NONE {
+                data = CompressionUtil::compress(&data, compression)?;
+            }
+
+            if encryption != Encryption::NONE {
+                data = security_util.encrypt_text_aes_cbc(&data, encryption)?;
+            }
+
+            security_util.base64_encode(&data)?
+        } else {
+            request_str.to_string()
+        };
+
+        stream.write_u8(compression).await?;
+        stream.write_u8(encryption).await?;
+        stream.write_all(payload.as_bytes()).await?;
+        stream.write_u8(0).await?;
         Ok(())
     }
 
-    /// Reads the response payload from the TCP stream.
-    ///
-    /// Protocol flow:
-    /// 1. Reads the compression flag.
-    /// 2. Reads the encryption flag.
-    /// 3. Reads the payload length.
-    /// 4. Reads the exact number of bytes specified by the length.
     async fn read_response(stream: &mut TcpStream) -> anyhow::Result<String> {
-        let _compression = stream.read_u8().await?;
-        let _encryption = stream.read_u8().await?;
-        let len = stream.read_u32().await? as usize;
-        let mut response = vec![0u8; len];
-        let n = stream.read_exact(&mut response).await?;
-        let response_str = String::from_utf8(Vec::from(&response[..n]))?;
-        Ok(response_str)
+        let compression = stream.read_u8().await?;
+        let encryption = stream.read_u8().await?;
+
+        let mut buf = Vec::new();
+        loop {
+            let byte = stream.read_u8().await?;
+            if byte == 0 {
+                break;
+            }
+            buf.push(byte);
+        }
+
+        let security_util = SecurityUtil::new();
+
+        if compression != Compression::NONE || encryption != Encryption::NONE {
+            let data = security_util.base64_decode(std::str::from_utf8(&buf)?)?;
+
+            let decrypted = if encryption != Encryption::NONE {
+                security_util.decrypt_text_aes_cbc(&data, encryption)?
+            } else {
+                data
+            };
+
+            let decompressed = if compression != Compression::NONE {
+                CompressionUtil::decompress(&decrypted, compression)?
+            } else {
+                decrypted
+            };
+
+            String::from_utf8(decompressed).map_err(|e| anyhow!("Invalid UTF-8: {}", e))
+        } else {
+            String::from_utf8(buf).map_err(|e| anyhow!("Invalid UTF-8: {}", e))
+        }
     }
 
     /// End-to-end wrapper for sending a request to the pgmoneta server and awaiting its response.
@@ -171,10 +224,12 @@ impl PgmonetaClient {
         tracing::info!(username = username, "Connected to server");
 
         let header = Self::build_request_header(command);
+        let compression = header.compression;
+        let encryption = header.encryption;
         let request = PgmonetaRequest { request, header };
 
         let request_str = serde_json::to_string(&request)?;
-        Self::write_request(&request_str, &mut stream).await?;
+        Self::write_request(&request_str, &mut stream, compression, encryption).await?;
         tracing::debug!(username = username, request = ?request, "Sent request to server");
         Self::read_response(&mut stream).await
     }
@@ -183,16 +238,47 @@ impl PgmonetaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configuration::{Configuration, PgmonetaConfiguration, PgmonetaMcpConfiguration};
+    use std::collections::HashMap;
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    fn init_test_config() {
+        INIT.call_once(|| {
+            let config = Configuration {
+                pgmoneta_mcp: PgmonetaMcpConfiguration {
+                    port: 8000,
+                    log_path: "test.log".to_string(),
+                    log_level: "info".to_string(),
+                    log_type: "console".to_string(),
+                    log_line_prefix: "%Y-%m-%d %H:%M:%S".to_string(),
+                    log_mode: "append".to_string(),
+                    log_rotation_age: "0".to_string(),
+                },
+                pgmoneta: PgmonetaConfiguration {
+                    host: "127.0.0.1".to_string(),
+                    port: 5001,
+                    compression: "zstd".to_string(),
+                    encryption: "aes_256_cbc".to_string(),
+                },
+                admins: HashMap::new(),
+                llm: None,
+            };
+            let _ = CONFIG.set(config);
+        });
+    }
 
     #[test]
     fn test_build_request_header() {
+        init_test_config();
         let header = PgmonetaClient::build_request_header(Command::INFO);
 
         assert_eq!(header.command, Command::INFO);
         assert_eq!(header.client_version, CLIENT_VERSION);
         assert_eq!(header.output_format, Format::JSON);
-        assert_eq!(header.compression, Compression::NONE);
-        assert_eq!(header.encryption, Encryption::NONE);
+        assert_eq!(header.compression, Compression::ZSTD);
+        assert_eq!(header.encryption, Encryption::AES_256_CBC);
 
         // Timestamp should be in YYYYMMDDHHmmss format (14 characters)
         assert_eq!(header.timestamp.len(), 14);
@@ -201,6 +287,7 @@ mod tests {
 
     #[test]
     fn test_build_request_header_different_commands() {
+        init_test_config();
         let header1 = PgmonetaClient::build_request_header(Command::INFO);
         let header2 = PgmonetaClient::build_request_header(Command::LIST_BACKUP);
 
@@ -211,6 +298,7 @@ mod tests {
 
     #[test]
     fn test_request_serialization() {
+        init_test_config();
         #[derive(Serialize, Clone, Debug)]
         struct TestRequest {
             field1: String,
@@ -294,6 +382,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_format() {
+        init_test_config();
         let header = PgmonetaClient::build_request_header(Command::INFO);
         let timestamp = &header.timestamp;
 
@@ -319,6 +408,7 @@ mod tests {
 
     #[test]
     fn test_request_clone() {
+        init_test_config();
         #[derive(Serialize, Clone, Debug)]
         struct TestRequest {
             data: String,

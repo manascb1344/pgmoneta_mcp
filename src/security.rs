@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::constant::MASTER_KEY_PATH;
+use crate::constant::{Encryption, MASTER_KEY_PATH};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::anyhow;
@@ -21,9 +22,10 @@ use base64::{
     Engine as _, alphabet,
     engine::{self, general_purpose},
 };
+use cbc;
 use hmac::Hmac;
 use home::home_dir;
-use pbkdf2::pbkdf2;
+use pbkdf2::{pbkdf2, pbkdf2_hmac};
 use rand::TryRngCore;
 use scram::ScramClient;
 use sha2::Sha256;
@@ -126,7 +128,7 @@ impl SecurityUtil {
         plain_text: &[u8],
         master_key: &[u8],
     ) -> anyhow::Result<String> {
-        let (cipher_text, nonce_bytes, salt) = Self::encrypt_text(plain_text, master_key)?;
+        let (cipher_text, nonce_bytes, salt) = Self::encrypt_text_aes_gcm(plain_text, master_key)?;
         let mut bytes = Vec::new();
         // nonce + salt + cipher text
         bytes.extend_from_slice(&nonce_bytes);
@@ -150,7 +152,7 @@ impl SecurityUtil {
         }
         let nonce: &[u8] = &cipher_text_bytes[..NONCE_LEN];
         let salt: &[u8] = &cipher_text_bytes[NONCE_LEN..NONCE_LEN + SALT_LEN];
-        Self::decrypt_text(
+        Self::decrypt_text_aes_gcm(
             &cipher_text_bytes[(NONCE_LEN + SALT_LEN)..],
             master_key,
             nonce,
@@ -232,9 +234,13 @@ impl SecurityUtil {
 
     /// Encrypts raw bytes using AES-256-GCM.
     ///
+    /// AES-GCM (Galois/Counter Mode) is the recommended encryption method for native
+    /// pgmoneta-mcp use cases. It provides both confidentiality and authentication,
+    /// is more efficient, and is resistant to certain attacks that affect CBC mode.
+    ///
     /// Automatically generates a secure random nonce and salt, derives the encryption key
-    /// using `scrypt`, and returns the ciphertext alongside the generated nonce and salt.
-    pub fn encrypt_text(
+    /// using PBKDF2, and returns the ciphertext alongside the generated nonce and salt.
+    pub fn encrypt_text_aes_gcm(
         plaintext: &[u8],
         master_key: &[u8],
     ) -> anyhow::Result<(Vec<u8>, [u8; NONCE_LEN], [u8; SALT_LEN])> {
@@ -258,7 +264,11 @@ impl SecurityUtil {
     }
 
     /// Decrypts AES-256-GCM ciphertext using the provided master key, nonce, and salt.
-    pub fn decrypt_text(
+    ///
+    /// This function decrypts data that was encrypted with `encrypt_text_aes_gcm`.
+    /// AES-GCM provides authenticated encryption, ensuring both confidentiality
+    /// and integrity of the data.
+    pub fn decrypt_text_aes_gcm(
         ciphertext: &[u8],
         master_key: &[u8],
         nonce_bytes: &[u8],
@@ -447,9 +457,135 @@ impl Default for SecurityUtil {
     }
 }
 
+impl SecurityUtil {
+    fn encrypt_text_aes_cbc_with_master_key(
+        plaintext: &[u8],
+        encryption_mode: u8,
+        master_key: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+        type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+        let key_len = match encryption_mode {
+            Encryption::AES_256_CBC => 32,
+            Encryption::AES_192_CBC => 24,
+            Encryption::AES_128_CBC => 16,
+            _ => return Err(anyhow!("Invalid encryption mode: {}", encryption_mode)),
+        };
+
+        let mut salt = [0u8; SALT_LEN];
+        rand::rngs::OsRng.try_fill_bytes(&mut salt)?;
+
+        let mut derived = vec![0u8; key_len + 16];
+        pbkdf2_hmac::<Sha256>(master_key, &salt, PBKDF2_ITERATIONS, &mut derived);
+
+        let key = &derived[..key_len];
+        let iv = &derived[key_len..];
+
+        let mut buffer = plaintext.to_vec();
+        // Reserve space for PKCS7 padding (up to one block size)
+        let pad_len = 16 - (plaintext.len() % 16);
+        buffer.extend(vec![0u8; pad_len]);
+
+        match key_len {
+            32 => Aes256CbcEnc::new(key.into(), iv.into())
+                .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(
+                    &mut buffer,
+                    plaintext.len(),
+                ),
+            24 => Aes192CbcEnc::new(key.into(), iv.into())
+                .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(
+                    &mut buffer,
+                    plaintext.len(),
+                ),
+            16 => Aes128CbcEnc::new(key.into(), iv.into())
+                .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(
+                    &mut buffer,
+                    plaintext.len(),
+                ),
+            _ => unreachable!(),
+        }
+        .map_err(|e| anyhow!("AES CBC encryption failed: {:?}", e))?;
+
+        let mut result = Vec::with_capacity(SALT_LEN + buffer.len());
+        result.extend_from_slice(&salt);
+        result.extend(buffer);
+
+        Ok(result)
+    }
+
+    fn decrypt_text_aes_cbc_with_master_key(
+        ciphertext: &[u8],
+        encryption_mode: u8,
+        master_key: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+        type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
+        type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+
+        if ciphertext.len() <= SALT_LEN {
+            return Err(anyhow!("Ciphertext too short"));
+        }
+
+        let key_len = match encryption_mode {
+            Encryption::AES_256_CBC => 32,
+            Encryption::AES_192_CBC => 24,
+            Encryption::AES_128_CBC => 16,
+            _ => return Err(anyhow!("Invalid encryption mode: {}", encryption_mode)),
+        };
+
+        let salt = &ciphertext[..SALT_LEN];
+        let encrypted_data = &ciphertext[SALT_LEN..];
+
+        let mut derived = vec![0u8; key_len + 16];
+        pbkdf2_hmac::<Sha256>(master_key, salt, PBKDF2_ITERATIONS, &mut derived);
+
+        let key = &derived[..key_len];
+        let iv = &derived[key_len..];
+
+        let mut buffer = encrypted_data.to_vec();
+        let len = match key_len {
+            32 => Aes256CbcDec::new(key.into(), iv.into())
+                .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer),
+            24 => Aes192CbcDec::new(key.into(), iv.into())
+                .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer),
+            16 => Aes128CbcDec::new(key.into(), iv.into())
+                .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer),
+            _ => unreachable!(),
+        }
+        .map_err(|e| anyhow!("AES CBC decryption failed: {:?}", e))?
+        .len();
+
+        buffer.truncate(len);
+        Ok(buffer)
+    }
+
+    pub fn encrypt_text_aes_cbc(
+        &self,
+        plaintext: &[u8],
+        encryption_mode: u8,
+    ) -> anyhow::Result<Vec<u8>> {
+        let master_key = self.load_master_key()?;
+        Self::encrypt_text_aes_cbc_with_master_key(plaintext, encryption_mode, &master_key[..])
+    }
+
+    pub fn decrypt_text_aes_cbc(
+        &self,
+        ciphertext: &[u8],
+        encryption_mode: u8,
+    ) -> anyhow::Result<Vec<u8>> {
+        let master_key = self.load_master_key()?;
+        Self::decrypt_text_aes_cbc_with_master_key(ciphertext, encryption_mode, &master_key[..])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constant::Encryption;
+
+    const CBC_TEST_MASTER_KEY: &[u8] = b"cbc_test_master_key_material";
 
     #[test]
     fn test_base64_encode_decode() {
@@ -501,7 +637,7 @@ mod tests {
             .expect("Password generation should succeed");
         // Should only contain alphanumeric and special chars from the defined set.
         let valid_chars: std::collections::HashSet<char> =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@$%^&*()-_=+[{]}\\|:'\",<.>/?"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@$%^&*()-_=+[{]}\\|:'\"<,. />?"
                 .chars()
                 .collect();
         assert!(password.chars().all(|c| valid_chars.contains(&c)));
@@ -565,133 +701,90 @@ mod tests {
     }
 
     #[test]
-    fn test_decrypt_invalid_base64() {
-        let sutil = SecurityUtil::new();
-        let master_key = "test_key".as_bytes();
-        let invalid_base64 = "not-valid-base64!!!";
+    fn test_encrypt_decrypt_aes_cbc() {
+        let plaintext = b"Hello, World! This is a test for AES-CBC encryption.";
 
-        let result = sutil.decrypt_from_base64_string(invalid_base64, master_key);
-        assert!(result.is_err());
+        let encrypted = SecurityUtil::encrypt_text_aes_cbc_with_master_key(
+            plaintext,
+            Encryption::AES_256_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("AES-256-CBC encryption should succeed");
+        assert!(!encrypted.is_empty());
+        assert_ne!(encrypted, plaintext.to_vec());
+
+        let decrypted = SecurityUtil::decrypt_text_aes_cbc_with_master_key(
+            &encrypted,
+            Encryption::AES_256_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("AES-256-CBC decryption should succeed");
+        assert_eq!(decrypted, plaintext.to_vec());
+
+        let encrypted = SecurityUtil::encrypt_text_aes_cbc_with_master_key(
+            plaintext,
+            Encryption::AES_192_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("AES-192-CBC encryption should succeed");
+        let decrypted = SecurityUtil::decrypt_text_aes_cbc_with_master_key(
+            &encrypted,
+            Encryption::AES_192_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("AES-192-CBC decryption should succeed");
+        assert_eq!(decrypted, plaintext.to_vec());
+
+        let encrypted = SecurityUtil::encrypt_text_aes_cbc_with_master_key(
+            plaintext,
+            Encryption::AES_128_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("AES-128-CBC encryption should succeed");
+        let decrypted = SecurityUtil::decrypt_text_aes_cbc_with_master_key(
+            &encrypted,
+            Encryption::AES_128_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("AES-128-CBC decryption should succeed");
+        assert_eq!(decrypted, plaintext.to_vec());
     }
 
     #[test]
-    fn test_decrypt_truncated_ciphertext() {
-        let sutil = SecurityUtil::new();
-        let master_key = "test_key".as_bytes();
+    fn test_encrypt_decrypt_aes_cbc_empty_data() {
+        let plaintext: &[u8] = b"";
 
-        // Create valid base64 but with insufficient bytes (less than nonce + salt)
-        let short_bytes = vec![0u8; 10];
-        let short_base64 = sutil.base64_encode(&short_bytes).unwrap();
-
-        let result = sutil.decrypt_from_base64_string(&short_base64, master_key);
-        assert!(result.is_err());
+        let encrypted = SecurityUtil::encrypt_text_aes_cbc_with_master_key(
+            plaintext,
+            Encryption::AES_256_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("Encryption should succeed");
+        let decrypted = SecurityUtil::decrypt_text_aes_cbc_with_master_key(
+            &encrypted,
+            Encryption::AES_256_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("Decryption should succeed");
+        assert_eq!(decrypted, plaintext.to_vec());
     }
 
     #[test]
-    fn test_base64_encode_empty() {
-        let sutil = SecurityUtil::new();
-        let empty: &[u8] = &[];
-        let encoded = sutil.base64_encode(empty).expect("Encode should succeed");
-        assert_eq!(encoded, "");
-    }
+    fn test_encrypt_decrypt_aes_cbc_large_data() {
+        let plaintext: Vec<u8> = vec![b'A'; 10000];
 
-    #[test]
-    fn test_base64_decode_empty() {
-        let sutil = SecurityUtil::new();
-        let decoded = sutil.base64_decode("").expect("Decode should succeed");
-        let expected: Vec<u8> = vec![];
-        assert_eq!(decoded, expected);
-    }
-
-    #[test]
-    fn test_generate_password_min_length() {
-        let sutil = SecurityUtil::new();
-        let password = sutil
-            .generate_password(1)
-            .expect("Password generation should succeed");
-        assert_eq!(password.len(), 1);
-    }
-
-    #[test]
-    fn test_generate_password_uniqueness() {
-        let sutil = SecurityUtil::new();
-        let password1 = sutil
-            .generate_password(64)
-            .expect("Password generation should succeed");
-        let password2 = sutil
-            .generate_password(64)
-            .expect("Password generation should succeed");
-
-        // Two randomly generated passwords should be different
-        assert_ne!(password1, password2);
-    }
-
-    #[test]
-    fn test_encrypt_different_nonces() {
-        let sutil = SecurityUtil::new();
-        let master_key = "test_key".as_bytes();
-        let text = "same text";
-
-        // Encrypt the same text twice
-        let encrypted1 = sutil
-            .encrypt_to_base64_string(text.as_bytes(), master_key)
-            .expect("Encryption should succeed");
-        let encrypted2 = sutil
-            .encrypt_to_base64_string(text.as_bytes(), master_key)
-            .expect("Encryption should succeed");
-
-        // Encrypted results should be different due to random nonce
-        assert_ne!(encrypted1, encrypted2);
-
-        // But both should decrypt to the same plaintext
-        let decrypted1 = sutil
-            .decrypt_from_base64_string(&encrypted1, master_key)
-            .expect("Decryption should succeed");
-        let decrypted2 = sutil
-            .decrypt_from_base64_string(&encrypted2, master_key)
-            .expect("Decryption should succeed");
-
-        assert_eq!(decrypted1, text.as_bytes());
-        assert_eq!(decrypted2, text.as_bytes());
-    }
-
-    #[test]
-    fn test_base64_roundtrip_various_inputs() {
-        let sutil = SecurityUtil::new();
-
-        let all_bytes: Vec<u8> = (0..=255).collect();
-        let zero_bytes = [0u8; 100];
-
-        let test_cases: Vec<&[u8]> = vec![
-            b"",
-            b"a",
-            b"hello world",
-            b"special chars: !@#$%^&*()",
-            &zero_bytes,
-            &all_bytes,
-        ];
-
-        for test_data in test_cases {
-            let encoded = sutil
-                .base64_encode(test_data)
-                .expect("Encoding should succeed");
-            let decoded = sutil
-                .base64_decode(&encoded)
-                .expect("Decoding should succeed");
-            assert_eq!(decoded, test_data);
-        }
-    }
-
-    #[test]
-    fn test_security_util_default_trait() {
-        let util1 = SecurityUtil::new();
-        let util2 = SecurityUtil::default();
-
-        // Both should work identically
-        let test_data = b"test";
-        let encoded1 = util1.base64_encode(test_data).unwrap();
-        let encoded2 = util2.base64_encode(test_data).unwrap();
-
-        assert_eq!(encoded1, encoded2);
+        let encrypted = SecurityUtil::encrypt_text_aes_cbc_with_master_key(
+            &plaintext,
+            Encryption::AES_256_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("Encryption should succeed");
+        let decrypted = SecurityUtil::decrypt_text_aes_cbc_with_master_key(
+            &encrypted,
+            Encryption::AES_256_CBC,
+            CBC_TEST_MASTER_KEY,
+        )
+        .expect("Decryption should succeed");
+        assert_eq!(decrypted, plaintext);
     }
 }

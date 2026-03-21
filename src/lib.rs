@@ -23,10 +23,12 @@
 //! * **`constant`**: Defines standard codes, commands, and formatting rules.
 //! * **`client`**: Manages low-level TCP communication with the pgmoneta server.
 //! * **`handler`**: Implements the MCP protocol and routes tool calls.
+//! * **`compression`**: Handles data compression and decompression.
 //! * **`security`**: Handles master key management, AES encryption, and SCRAM authentication.
 //! * **`utils`**: Provides shared helper functions.
 
 pub mod agent;
+pub mod compression;
 pub mod configuration;
 pub mod constant;
 pub mod handler;

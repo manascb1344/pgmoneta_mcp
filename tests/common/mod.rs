@@ -31,6 +31,8 @@ pub fn init_config() {
             pgmoneta: PgmonetaConfiguration {
                 host: "127.0.0.1".to_string(),
                 port: 5002,
+                compression: "zstd".to_string(),
+                encryption: "aes_256_cbc".to_string(),
             },
             admins,
             llm: None,
