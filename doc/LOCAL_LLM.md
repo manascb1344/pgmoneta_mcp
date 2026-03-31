@@ -8,7 +8,7 @@ implementation details.
 
 This guide covers:
 
-* Installing Ollama or llama.cpp
+* Installing Ollama, llama.cpp, or vLLM
 * Downloading and validating a model
 * Configuring the `[llm]` section in `pgmoneta-mcp.conf`
 
@@ -163,11 +163,51 @@ model = Meta-Llama-3.1-8B-Instruct-Q4_K_M
 max_tool_rounds = 10
 ```
 
+## vLLM
+
+[vLLM](https://github.com/vllm-project/vllm) is a high-throughput and memory-efficient engine for LLMs that natively exposes an OpenAI-compatible API.
+
+### Install
+
+Install vLLM via pip (a virtual environment is recommended):
+
+```
+pip install vllm
+```
+
+### Start the server
+
+vLLM automatically downloads standard Safetensor models from Hugging Face:
+
+```
+python -m vllm.entrypoints.openai.api_server \
+  --model ibm-granite/granite-3.0-8b-instruct \
+  --port 8000
+```
+
+Verify it is running:
+
+```
+curl http://localhost:8000/v1/models
+```
+
+### Configuration
+
+Add an `[llm]` section to your `pgmoneta-mcp.conf`:
+
+```ini
+[llm]
+provider = vllm
+endpoint = http://localhost:8000
+model = ibm-granite/granite-3.0-8b-instruct
+max_tool_rounds = 10
+```
+
 ### Configuration properties
 
 | Property | Default | Required | Description |
 | :------- | :------ | :------- | :---------- |
-| provider |  | Yes | The LLM provider backend (`ollama` or `llama.cpp`) |
+| provider |  | Yes | The LLM provider backend (`ollama`, `llama.cpp` or `vllm`) |
 | endpoint |  | Yes | The URL of the LLM inference server |
 | model |  | Yes | The model name to use for inference |
 | max_tool_rounds | 10 | No | Maximum tool-calling iterations per user prompt |
@@ -184,6 +224,11 @@ max_tool_rounds = 10
     For llama.cpp:
     ```
     curl http://localhost:8080/health
+    ```
+
+    For vLLM:
+    ```
+    curl http://localhost:8000/v1/models
     ```
 
 2. Start pgmoneta MCP with your config file:

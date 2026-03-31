@@ -19,13 +19,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Client for communicating with a llama.cpp inference server (`llama-server`).
+/// Client for communicating with an OpenAI-compatible inference server (e.g. `llama-server`, `vLLM`).
 ///
 /// Uses the standard OpenAI-compatible `/v1/chat/completions` endpoint for tool/function calling.
-/// The model loaded into `llama-server` must have tool-calling templates aligned with the OpenAI
+/// The model loaded into the server must have tool-calling templates aligned with the OpenAI
 /// function calling specification.
-pub struct LlamaCppClient {
+pub struct OpenAiClient {
     http_client: Client,
+    provider_name: String,
     endpoint: String,
     model: String,
 }
@@ -108,36 +109,41 @@ fn parse_tool_arguments(arguments: &str) -> anyhow::Result<HashMap<String, serde
         .map_err(|e| anyhow!("Failed to parse JSON arguments from tool call: {}", e))
 }
 
-impl LlamaCppClient {
-    /// Creates a new `LlamaCppClient`.
+impl OpenAiClient {
+    /// Creates a new `OpenAiClient`.
     ///
     /// # Arguments
-    /// * `endpoint` - The base URL of the llama.cpp server (e.g., `http://localhost:8080`).
+    /// * `provider_name` - The logical name of the backend (e.g. `llama.cpp`, `vllm`).
+    /// * `endpoint` - The base URL of the inference server (e.g., `http://localhost:8080`).
     /// * `model` - The model ID or name to include in chat requests.
-    pub fn new(endpoint: &str, model: &str) -> Self {
+    pub fn new(provider_name: &str, endpoint: &str, model: &str) -> Self {
         Self {
             http_client: Client::new(),
+            provider_name: provider_name.to_string(),
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model: model.to_string(),
         }
     }
 
-    /// Checks whether the llama.cpp server is running and reachable.
+    /// Checks whether the inference server is running and reachable.
     ///
     /// # Returns
     /// `Ok(())` if the server responds to a basic `/health` endpoint, or an error.
     pub async fn health_check(&self) -> anyhow::Result<()> {
         let url = format!("{}/health", self.endpoint);
-        let resp = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Cannot reach llama.cpp at {}: {}", self.endpoint, e))?;
+        let resp = self.http_client.get(&url).send().await.map_err(|e| {
+            anyhow!(
+                "Cannot reach {} at {}: {}",
+                self.provider_name,
+                self.endpoint,
+                e
+            )
+        })?;
 
         if !resp.status().is_success() {
             return Err(anyhow!(
-                "llama.cpp health check failed with status {}",
+                "{} health check failed with status {}",
+                self.provider_name,
                 resp.status()
             ));
         }
@@ -155,10 +161,14 @@ impl LlamaCppClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| anyhow!("Failed to list models from llama.cpp: {}", e))?;
+            .map_err(|e| anyhow!("Failed to list models from {}: {}", self.provider_name, e))?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!("Failed to list models, status: {}", resp.status()));
+            return Err(anyhow!(
+                "Failed to list models from {}, status: {}",
+                self.provider_name,
+                resp.status()
+            ));
         }
 
         let models_resp: OpenAiModelsResponse = resp.json().await?;
@@ -176,8 +186,8 @@ impl LlamaCppClient {
     }
 }
 
-impl LlmClient for LlamaCppClient {
-    /// Sends a chat request to the llama.cpp server using the OpenAI `/v1/chat/completions` API.
+impl LlmClient for OpenAiClient {
+    /// Sends a chat request to the inference server using the OpenAI `/v1/chat/completions` API.
     ///
     /// Returns either a text response or a list of tool calls the model wants to invoke.
     async fn chat(
@@ -195,10 +205,11 @@ impl LlmClient for LlamaCppClient {
         };
 
         tracing::debug!(
+            provider = %self.provider_name,
             model = %self.model,
             messages = messages.len(),
             tools = tools.len(),
-            "Sending chat request to llama.cpp"
+            "Sending chat request to OpenAI-compatible provider"
         );
 
         let resp = self
@@ -207,28 +218,38 @@ impl LlmClient for LlamaCppClient {
             .json(&request)
             .send()
             .await
-            .map_err(|e| anyhow!("Failed to send chat request to llama.cpp: {}", e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to send chat request to {}: {}",
+                    self.provider_name,
+                    e
+                )
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
-                "llama.cpp chat completion failed (status {}): {}",
+                "{} chat completion failed (status {}): {}",
+                self.provider_name,
                 status,
                 body
             ));
         }
 
-        let chat_resp: OpenAiChatResponse = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse llama.cpp chat response: {}", e))?;
+        let chat_resp: OpenAiChatResponse = resp.json().await.map_err(|e| {
+            anyhow!(
+                "Failed to parse {} chat response: {}",
+                self.provider_name,
+                e
+            )
+        })?;
 
         let message = chat_resp
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow!("llama.cpp returned empty choices list"))?
+            .ok_or_else(|| anyhow!("{} returned empty choices list", self.provider_name))?
             .message;
 
         match message.tool_calls {
@@ -256,7 +277,7 @@ impl LlmClient for LlamaCppClient {
 mod tests {
     use super::*;
 
-    /// Verifies that a plain text response from llama-server is parsed correctly.
+    /// Verifies that a plain text response from an OpenAI-compatible server is parsed correctly.
     #[test]
     fn test_parse_text_response() {
         let json = r#"
@@ -283,7 +304,7 @@ mod tests {
     }
 
     /// Verifies that a tool call response is parsed and arguments are deserialized correctly.
-    /// In the OpenAI/llama.cpp schema, `arguments` is a *stringified* JSON object.
+    /// In the OpenAI schema, `arguments` is a *stringified* JSON object.
     #[test]
     fn test_parse_tool_call_response() {
         let json = r#"
@@ -332,10 +353,10 @@ mod tests {
         );
     }
 
-    /// Verifies the LlamaCppClient is constructed correctly and trims trailing slashes.
+    /// Verifies the OpenAiClient is constructed correctly and trims trailing slashes.
     #[test]
     fn test_client_construction() {
-        let client = LlamaCppClient::new("http://localhost:8080/", "my-model");
+        let client = OpenAiClient::new("vllm", "http://localhost:8080/", "my-model");
         assert_eq!(client.endpoint(), "http://localhost:8080");
         assert_eq!(client.model(), "my-model");
     }

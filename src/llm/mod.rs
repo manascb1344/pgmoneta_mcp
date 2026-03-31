@@ -13,8 +13,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-pub mod llama_cpp;
 pub mod ollama;
+pub mod openai;
+
+pub use ollama::OllamaClient;
+pub use openai::OpenAiClient;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,7 +87,7 @@ pub enum LlmResponse {
 /// Trait defining the interface for an LLM client.
 ///
 /// Implementations of this trait handle communication with a specific LLM
-/// inference server (e.g., Ollama, llama.cpp).
+/// inference server (e.g., Ollama, vLLM, llama.cpp).
 #[allow(async_fn_in_trait)]
 pub trait LlmClient {
     /// Sends a conversation with available tool definitions to the LLM and returns its response.
@@ -104,7 +107,7 @@ pub trait LlmClient {
 
 /// Converts MCP tool objects (from `rmcp`) into the LLM function-calling schema format.
 ///
-/// This bridges the MCP tool discovery output to what LLMs like Ollama/llama.cpp expect.
+/// This bridges the MCP tool discovery output to what LLMs like Ollama/OpenAI-compatible servers expect.
 ///
 /// # Arguments
 /// * `tools` - A slice of `rmcp::model::Tool` objects discovered from an MCP server.

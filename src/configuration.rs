@@ -234,7 +234,7 @@ fn normalize_configuration(mut conf: Configuration) -> anyhow::Result<Configurat
 
 fn validate_llm_provider(provider: &str) -> anyhow::Result<()> {
     match provider.to_lowercase().as_str() {
-        "ollama" | "llama.cpp" => Ok(()),
+        "ollama" | "llama.cpp" | "vllm" => Ok(()),
         _ => Err(anyhow!("Unsupported LLM provider '{}'", provider)),
     }
 }

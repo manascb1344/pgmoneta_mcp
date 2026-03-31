@@ -45,13 +45,13 @@ between ease of use and granular control.
 
 ### Runtime comparison
 
-| Feature | Ollama | llama.cpp |
-| :--- | :--- | :--- |
-| **Installation** | Single binary / installer | Download or build binary |
-| **Model Management** | Built-in CLI (`pull`, `list`) | Manual download of `.gguf` files |
-| **Ease of Use** | High (recommended for beginners) | Advanced (manual configuration) |
-| **Control** | Automatic hardware detection | Granular threading/GPU/RAM control |
-| **Performance** | Excellent (balanced) | Maximum (optimized for specific hardware** |
+| Feature | Ollama | llama.cpp | vLLM |
+| :--- | :--- | :--- | :--- |
+| **Installation** | Single binary / installer | Download or build binary | Python package (pip) |
+| **Model Management** | Built-in CLI (`pull`, `list`) | Manual download of `.gguf` files | Auto-downloads Safetensors |
+| **Ease of Use** | High (recommended for beginners) | Advanced (manual configuration) | Intermediate |
+| **Control** | Automatic hardware detection | Granular threading/GPU/RAM control | High-throughput optimizations |
+| **Performance** | Excellent (balanced) | Maximum (optimized for specific hardware) | Production-grade throughput |
 
 ### Pros and Cons
 
@@ -84,6 +84,20 @@ between ease of use and granular control.
 * **No built-in model registry**: You must manually find, download, and organize `.gguf` model files from sources like Hugging Face.
 * **No model management**: No built-in equivalent of `ollama list` or `ollama pull`. You manage model files and versions yourself.
 * **Manual startup**: Requires a precise launch command each time (`--model`, `--port`, `--ctx-size`, etc.), with no automatic restart on failure.
+
+**vLLM**
+
+**Pros:**
+
+* **Production-grade throughput**: Replaces standard sequence processing with PagedAttention, allowing for massive batched throughput.
+* **OpenAI-compatible**: Exposes a standard `/v1/chat/completions` API out of the box.
+* **Auto-downloads weights**: Transparently pulls industry-standard Safetensor weights from Hugging Face when you specify a model ID, removing the need for `gguf` conversion or manual downloads.
+
+**Cons:**
+
+* **High resource overhead**: Optimized for serving multiple requests simultaneously, rendering its baseline idle CPU/VRAM footprint larger than Ollama or llama.cpp.
+* **Python dependency stack**: Installation pulls down heavy dependencies (like PyTorch and CUDA bindings) unless managed firmly via virtual environments or Docker.
+* **Lacks low-end quantization**: Not designed for hyper-compressed formats (like `Q2_K`) frequently used to squeeze models onto low-end hardware.
 
 ## Recommended models
 
@@ -133,4 +147,8 @@ The following models are verified for tool-calling performance. Sizes are based 
 | Mistral (7B) | ~4.1 GB | ~8 GB | Solid general-purpose model |
 | Mixtral (8x7B) | ~26.0 GB | ~32 GB | High quality, high hardware cost |
 
-Examples of provider-specific model names can be found in the Ollama and llama.cpp sections below.
+Examples of provider-specific model names can be found in the Ollama, llama.cpp, and vLLM sections below.
+
+## Next step
+
+The next chapters document the recommended local runtimes: **Ollama**, **llama.cpp**, and **vLLM**, including installation, model setup, and configuration.
